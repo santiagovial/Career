@@ -5,7 +5,11 @@
 //   2. Agrupar por `head_sha` en local: un SHA → una decisión, aunque tenga 3 runs (matriz) esperando.
 //   3. Aprobar solo si: la PR está ABIERTA · el run es del `head.sha` ACTUAL de la PR · el autor no es bot ·
 //      la PR no toca `.github/**` ni `package.json`/`package-lock.json` (un run aprobado ejecuta el código del
-//      fork) · pudimos leer sus ficheros (lista vacía = "no pude ver", nunca "inocuo").
+//      fork) · pudimos leer sus ficheros (lista vacía = "no pude ver", nunca "inocuo") · la lista está
+//      COMPLETA (`changedFiles`), porque una lista cortada esconde justo lo que no se revisó y un recuento
+//      desconocido no permite saber si lo está · la lista y el head vienen de la MISMA respuesta de GraphQL
+//      (`headRefOid` + `files`), que es lo único que impide aprobar el SHA A con los ficheros del head B; una
+//      PR con más de una página de ficheros se rechaza en vez de aprobarse a ciegas.
 //   4. Tope 20 aprobaciones por ejecución. El resto se queda para la siguiente pasada (*/30).
 // Env: GITHUB_TOKEN (o CI_APPROVE_TOKEN, ver ci-approve.yml) · GITHUB_REPOSITORY · DRY_RUN · CI_APPROVE_MAX (20)
 
@@ -42,6 +46,56 @@ async function getAll(url) {
     const m = /<([^>]+)>;\s*rel="next"/.exec(link); next = m ? m[1] : null;
   }
   return out;
+}
+
+/** GraphQL: una sola respuesta trae el head y la lista de ficheros de ese head. */
+async function graphql(query, variables) {
+  const res = await fetch(`${API}/graphql`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json', 'user-agent': 'career-ops-ci-approve' },
+    body: JSON.stringify({ query, variables }),
+  });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok || (body.errors || []).length) {
+    const message = body.errors?.[0]?.message || `HTTP ${res.status}`;
+    const e = new Error(`graphql ${message.slice(0, 160)}`);
+    e.status = res.status;
+    e.rateLimited = res.status === 429 || /rate limit/i.test(message);
+    throw e;
+  }
+  return body.data;
+}
+
+/**
+ * ¿Una respuesta de GraphQL ata la lista de ficheros al SHA que se va a aprobar?
+ *
+ * `pulls/{n}/files` no acepta un SHA ni lo devuelve: la lista es la del head que
+ * haya al construir cada página, y por eso un contribuidor que empuja entre dos
+ * lecturas puede colar los ficheros de otro head. El objeto `pullRequest` de
+ * GraphQL devuelve `headRefOid` y `files` en la MISMA respuesta, que es la única
+ * forma que da esta API de atar las dos cosas. Si la PR pasa de una página de
+ * ficheros, se rechaza en vez de aprobar con una lista que puede no ser la del
+ * head: aprobar a mano siempre está disponible.
+ */
+export function fileListBinding({ headRefOid, changedFiles, files }, sha) {
+  if (headRefOid !== sha) {
+    return { ok: false, headMoved: true, why: `el head es ${String(headRefOid).slice(0, 7)}, no ${sha.slice(0, 7)}` };
+  }
+  if (!files || files.pageInfo?.hasNextPage) {
+    return { ok: false, why: 'más de 100 ficheros: una sola lectura no se puede atar al SHA, apruébala a mano' };
+  }
+  return { ok: true, files: (files.nodes || []).map((f) => ({ filename: f.path })), declared: changedFiles };
+}
+
+async function filesForHead(prNumber, sha) {
+  const [owner, name] = REPO.split('/');
+  const data = await graphql(
+    `query($owner:String!,$name:String!,$n:Int!){repository(owner:$owner,name:$name){pullRequest(number:$n){headRefOid changedFiles files(first:100){pageInfo{hasNextPage} nodes{path}}}}}`,
+    { owner, name, n: prNumber },
+  );
+  const pr = data?.repository?.pullRequest;
+  if (!pr) return { ok: false, why: `#${prNumber}: no pude leer la PR` };
+  return fileListBinding(pr, sha);
 }
 
 /** Todos los runs `action_required` de pull_request. La API corta en 1000 resultados por búsqueda (23-sep: 1098 retenidos, los 98
@@ -91,6 +145,26 @@ export function decide({ sha, pr, files }) {
   if (pr.head.sha !== sha) return { ok: false, why: `SHA no es el head actual de #${pr.number} (${pr.head.sha.slice(0, 7)})` };
   if (isBot(pr.user)) return { ok: false, why: `autor bot (${pr.user.login})` };
   if (!files || !files.length) return { ok: false, why: `#${pr.number}: no pude leer sus ficheros, no apruebo a ciegas` };
+  // Una lista corta no es una lista limpia. `pulls/{n}/files` tiene tope, así que
+  // un PR grande devuelve menos entradas de las que declara `changed_files`: el
+  // fichero que importa puede estar justo en el tramo que no se leyó. Comparar los
+  // dos números es la única forma de distinguir "no toca nada prohibido" de "no
+  // vi todo lo que toca" (un run aprobado ejecuta el código del fork).
+  //
+  // El número viene del detalle de la PR (`GET pulls/{n}`), no de la lista de PRs
+  // abiertas: esa lista no trae `changed_files`, así que leerlo de ahí dejaba la
+  // comprobación sin efecto. Si el detalle no lo trae, no se aprueba: no saber
+  // cuántos ficheros hay es el caso "no pude ver", no el caso "inocuo".
+  // Solo un entero no negativo cuenta. `Number(null)` y `Number('')` dan 0, que
+  // es finito y pasaria la comparacion: un detalle con `changed_files: null` y
+  // una lista limpia se aprobaria como si el PR no tocara nada.
+  const declared = pr.changed_files;
+  if (!Number.isInteger(declared) || declared < 0) {
+    return { ok: false, why: `#${pr.number}: no pude leer cuántos ficheros declara, no apruebo a ciegas` };
+  }
+  if (files.length < declared) {
+    return { ok: false, why: `#${pr.number}: la lista de ficheros está incompleta (${files.length} de ${declared}), no apruebo a ciegas` };
+  }
   const bad = touchesForbidden(files);
   if (bad.length) return { ok: false, why: `#${pr.number} toca ${bad.slice(0, 3).map((f) => f.filename || f).join(', ')}` };
   return { ok: true, why: `#${pr.number} abierta, head actual, autor ${pr.user.login}, ${files.length} ficheros seguros` };
@@ -121,12 +195,28 @@ export async function main() {
     const pr = bySha.get(sha) || null;
     if (!pr) { orphans++; continue; } // no es el head de ninguna PR abierta (push encima, cerrada o fusionada): nada que aprobar
     let files = [];
-    try { files = await getAll(`repos/${REPO}/pulls/${pr.number}/files`); }
-    catch (e) {
+    let declaredFiles;
+    try {
+      // Una sola respuesta de GraphQL trae el head y su lista de ficheros, que es
+      // lo que ata la lista al SHA aprobado. El endpoint REST no acepta un SHA ni
+      // lo devuelve, así que leerlo dos veces no probaba nada: un contribuidor que
+      // empuja entre las dos lecturas dejaba pasar los ficheros de otro head.
+      const read = await filesForHead(pr.number, sha);
+      if (!read.ok) {
+        if (read.headMoved) {
+          log(`#${pr.number}: el head cambió mientras leía sus ficheros (${read.why}): este SHA ya no es el head actual`);
+        } else {
+          log(`#${pr.number} ${sha.slice(0, 7)}: no : ${read.why}`);
+        }
+        continue;
+      }
+      files = read.files;
+      declaredFiles = read.declared;
+    } catch (e) {
       if (e.rateLimited) { stop = 'rate'; log(`#${pr.number} ${sha.slice(0, 7)}: límite de tasa de GitHub al leer sus ficheros (${e.status}): se para la pasada; la siguiente lo reintenta`); break; }
       log(`#${pr.number} ${sha.slice(0, 7)}: no pude leer sus ficheros (${e.message.slice(0, 80)}): no apruebo`); continue;
     }
-    const d = decide({ sha, pr, files });
+    const d = decide({ sha, pr: { ...pr, changed_files: declaredFiles }, files });
     if (!d.ok) { log(`#${pr.number} ${sha.slice(0, 7)}: no : ${d.why}`); continue; }
     tried++;
     let all = true;
