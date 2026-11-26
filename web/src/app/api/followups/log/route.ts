@@ -49,6 +49,14 @@ export async function POST(req: Request) {
   const company = cell(body.company, 80);
   if (!company) return Response.json({ error: "company required" }, { status: 400 });
 
+  // date and channel are trimmed before validation, so a non-string (a JSON
+  // number, object, array) would throw instead of answering 400. The free-text
+  // fields above and below go through cell(), which stringifies.
+  for (const field of ["date", "channel"] as const) {
+    if (body[field] != null && typeof body[field] !== "string") {
+      return Response.json({ error: `${field} must be a string` }, { status: 400 });
+    }
+  }
   // Default to the LOCAL day (local-first app — server clock is the user's
   // clock); validate as a REAL calendar date, not just the shape: one
   // impossible date (2026-13-45) in the log would crash the cadence engine.
